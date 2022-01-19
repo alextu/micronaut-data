@@ -46,12 +46,14 @@ allOpen {
 
 compileKotlin {
     kotlinOptions {
+        freeCompilerArgs = ["-Xjvm-default=all"]
         jvmTarget = '1.8'
     }
 }
 
 compileTestKotlin {
     kotlinOptions {
+        freeCompilerArgs = ["-Xjvm-default=all"]
         jvmTarget = '1.8'
     }
 }

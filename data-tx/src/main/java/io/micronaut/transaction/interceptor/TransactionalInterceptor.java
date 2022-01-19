@@ -19,6 +19,7 @@ import io.micronaut.aop.InterceptPhase;
 import io.micronaut.aop.InterceptedMethod;
 import io.micronaut.aop.MethodInterceptor;
 import io.micronaut.aop.MethodInvocationContext;
+import io.micronaut.aop.kotlin.KotlinInterceptedMethod;
 import io.micronaut.context.BeanLocator;
 import io.micronaut.context.exceptions.ConfigurationException;
 import io.micronaut.core.annotation.AnnotationValue;
@@ -35,13 +36,17 @@ import io.micronaut.transaction.exceptions.NoTransactionException;
 import io.micronaut.transaction.exceptions.TransactionSystemException;
 import io.micronaut.transaction.reactive.ReactiveTransactionOperations;
 import io.micronaut.transaction.reactive.ReactiveTransactionStatus;
+import io.micronaut.transaction.support.TransactionSynchronizationManager;
 import jakarta.inject.Singleton;
+import kotlin.coroutines.CoroutineContext;
 import org.reactivestreams.Publisher;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -92,6 +97,7 @@ public class TransactionalInterceptor implements MethodInterceptor<Object, Objec
     @Override
     public Object intercept(MethodInvocationContext<Object, Object> context) {
         InterceptedMethod interceptedMethod = InterceptedMethod.of(context);
+        boolean isKotlinSuspended = interceptedMethod instanceof KotlinInterceptedMethod;
         try {
             boolean isReactive = interceptedMethod.resultType() == InterceptedMethod.ResultType.PUBLISHER;
             boolean isAsync = interceptedMethod.resultType() == InterceptedMethod.ResultType.COMPLETION_STAGE;
@@ -100,7 +106,7 @@ public class TransactionalInterceptor implements MethodInterceptor<Object, Objec
                     .computeIfAbsent(context.getExecutableMethod(), executableMethod -> {
                         final String qualifier = executableMethod.stringValue(TransactionalAdvice.class).orElse(null);
 
-                        if (isReactive || isAsync) {
+                        if ((isReactive || isAsync) && !isKotlinSuspended) {
                             ReactiveTransactionOperations<?> reactiveTransactionOperations
                                     = beanLocator.findBean(ReactiveTransactionOperations.class, qualifier != null ? Qualifiers.byName(qualifier) : null).orElse(null);
                             if (isReactive && reactiveTransactionOperations == null) {
@@ -133,7 +139,32 @@ public class TransactionalInterceptor implements MethodInterceptor<Object, Objec
                     if (transactionInvocation.reactiveTransactionOperations != null) {
                         return interceptedMethod.handleResult(interceptedMethod.interceptResult());
                     } else {
-                        throw new ConfigurationException("Async return type doesn't support transactional execution.");
+                        if (isKotlinSuspended) {
+                            final SynchronousTransactionManager<?> transactionManager = transactionInvocation.transactionManager;
+                            final TransactionInfo transactionInfo = createTransactionIfNecessary(
+                                    transactionManager,
+                                    definition,
+                                    context.getExecutableMethod()
+                            );
+                            KotlinInterceptedMethod kotlinInterceptedMethod = (KotlinInterceptedMethod) interceptedMethod;
+                            CoroutineContext existingContext = kotlinInterceptedMethod.getCoroutineContext();
+                            kotlinInterceptedMethod.updateCoroutineContext(existingContext.plus(new TxContextElement(TransactionSynchronizationManager.copyState())));
+                            CompletionStage<?> result = interceptedMethod.interceptResultAsCompletionStage();
+                            CompletableFuture newResult = new CompletableFuture();
+                            result.whenComplete((o, throwable) -> {
+                                if (throwable == null) {
+                                   commitTransactionAfterReturning(transactionInfo);
+                                   newResult.complete(o);
+                               } else {
+                                   completeTransactionAfterThrowing(transactionInfo, throwable);
+                                   newResult.completeExceptionally(throwable);
+                               }
+                               cleanupTransactionInfo(transactionInfo);
+                            });
+                            return interceptedMethod.handleResult(newResult);
+                        } else {
+                            throw new ConfigurationException("Async return type doesn't support transactional execution.");
+                        }
                     }
                 case SYNCHRONOUS:
                     final SynchronousTransactionManager<?> transactionManager = transactionInvocation.transactionManager;
